@@ -1,52 +1,65 @@
 (ns serde.bytes-test
-  (:require
-    [clojure.instant :as inst]
-    [clojure.test :refer [deftest are]]
-    [java-time :as time]
-    [serde.bytes :as sut]
-    [serde.core :as s]
-    [serde.type :as t]))
+  (:require [clojure.test :refer [deftest testing are]]
+            [serde.bytes :as sut]
 
+            [clojure.instant :as inst]
+            [java-time :as time]
+            [serde.core :as s]))
 
-(defn make-conn
-  [type]
-  (let [bytes (volatile! [])]
-    (s/conn (sut/src type (sut/read-byte!->le-read-bytes!
-                            #(let [[f & r] @bytes]
-                               (vreset! bytes r)
-                               f)))
-            (sut/dest type (sut/write-byte!->le-write-bytes!
-                             #(vswap! bytes conj %))))))
+(defn serde! [spec val]
+  (let [snk (sut/memsnk)]
+    (sut/ser! spec snk val)
+    (let [src (-> snk sut/memsnk-bytes sut/collsrc)]
+      (sut/de! spec src))))
 
+(deftest de!-is-inverse-of-ser!
+  (testing "numbers"
+    (are [spec val]
+         (= val (serde! spec val))
+      s/byte 123
+      s/byte -123
+      s/int 512
+      s/int -512
+      s/long 32010
+      s/long -32010))
 
-;; TODO: make value generator based on type and rewrite to test.check
+  (testing "floats"
+    (are [spec val]
+         (Float/compare val (serde! spec val))
+      s/float 3.1415
+      s/float -3.12345))
 
-(deftest write-read-are-inverse
-  (are [type val]
-       (let [conn! (make-conn type)]
-         (conn! val)
-         (= val (conn!)))
-    t/byte 3
-    t/bool true
-    t/bool false
-    t/double 1.1
-    t/long 1
-    t/int 1
-    t/str "test"
-    t/time (apply time/local-date-time (take 6 (inst/parse-timestamp vector "2001")))
+  (testing "doubles"
+    (are [spec val]
+         (Double/compare val (serde! spec val))
+      s/double 3.141514
+      s/double -3.1415123))
 
-    (t/vec t/long t/double t/str) [1 1.1 "a"]
-    (t/list t/long) [1 2]
-    (t/list t/str) (list "1" "x")
-    (t/list t/long) (range 3)
-    (t/choice [:a t/int] [:b t/str]) [:b "aboj"]
-    (t/choice [:a t/int] [:b t/str]) [:a 3]
+  (testing "compounds"
+    (are [spec val]
+         (= val (serde! spec val))
+      s/boolean true
+      s/boolean false
 
-    (t/seq t/byte) (range 10)
+      s/time (apply time/local-date-time (take 6 (inst/parse-timestamp vector "2001")))
 
-    (t/map [:name t/str]
-           [:age t/int]
-           [:kids (t/list t/str)])
-    {:name "John"
-     :age 34
-     :kids ["Hannah"]}))
+      (s/vector s/byte s/int) [-10 666]
+
+      (s/list s/byte) '(1 2 -3 -100)
+
+      s/string "done 666"
+
+      (s/choice [:byte s/byte]
+                [:string s/string])
+      [:string "done"]
+
+      (s/choice [:byte s/byte]
+                [:string s/string])
+      [:byte 20]
+
+      (s/map [:name s/string]
+             [:age s/int]
+             [:kids (s/list s/string)])
+      {:name "John"
+       :age 34
+       :kids ["Hannah"]})))

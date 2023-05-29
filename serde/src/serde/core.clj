@@ -1,33 +1,83 @@
 (ns serde.core
-  "Serialization and deserialization library.
-   
-   This library works with sources and destinations. You can think of them
-   like deserializers and serializers that deals with only one value, i.e.,
-   source of double deserializes a value on first call and memoize it. 
-   Similarly it works for destination.")
+  (:refer-clojure :exclude [byte boolean int long float double time map vector list])
+  (:require [clojure.core :as core]))
 
+(defrecord ByteSpec [])
 
-(defn value->src
-  [val]
-  (fn [] val))
+(def byte
+  "Specification for byte number."
+  (->ByteSpec))
 
+(defrecord BoolSpec [])
 
-(def void-dest (fn [_]))
+(def boolean
+  "Specification for boolean."
+  (->BoolSpec))
 
+(defrecord IntSpec [])
 
-(defn src
-  [read!]
-  (memoize #(read!)))
+(def int
+  "Specification for integer number."
+  (->IntSpec))
 
+(defrecord LongSpec [])
 
-(defn dest
-  [write!]
-  (memoize #(write! %)))
+(def long
+  "Specification for long number."
+  (->LongSpec))
 
+(defrecord FloatSpec [])
 
-(defn conn
-  "Connection is a source and destination at the same time."
-  [src dest]
-  (fn
-    ([] (src))
-    ([val] (dest val))))
+(def float
+  "Specification for float number."
+  (->FloatSpec))
+
+(defrecord DoubleSpec [])
+
+(def double
+  "Specification for double number."
+  (->DoubleSpec))
+
+(defrecord TimeSpec [])
+
+(def time
+  "Specification for time."
+  (->TimeSpec))
+
+(defrecord ListSpec [spec])
+
+(defn list
+  "Specification for fixed size list of values."
+  [spec]
+  (->ListSpec spec))
+
+(defrecord StringSpec [])
+
+(def string
+  "Specification for string value."
+  (->StringSpec))
+
+(defrecord VectorSpec [specs])
+
+(defn vector
+  "Specification for fixed size vector."
+  [& specs]
+  (->VectorSpec specs))
+
+(defrecord ChoiceSpec [keyspecs])
+
+(defn choice
+  "Specification for choice from fixed number of tagged things.
+
+  Choice specifies a vector of tag and value.
+
+  Example:
+  (def payment (choice [:cash nil] [:card long]))
+  "
+  [& keyspecs]
+  (->ChoiceSpec (vec keyspecs)))
+(defrecord MapSpec [keyspecs])
+
+(defn map
+  [& keyspecs]
+  (->MapSpec keyspecs))

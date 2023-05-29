@@ -1,214 +1,194 @@
 (ns serde.bytes
   "Ser/de to/from sequence of bytes."
-  (:require
-    [serde.type :as t])
-  (:import
-    (java.time
-      LocalDateTime
-      ZoneOffset)))
+  (:require [serde.core :as s])
+  (:import (serde.core ByteSpec
+                       BoolSpec
+                       IntSpec
+                       LongSpec
+                       FloatSpec
+                       DoubleSpec
+                       TimeSpec
+                       ListSpec
+                       StringSpec
+                       VectorSpec
+                       ChoiceSpec
+                       MapSpec)
+           (java.time ZoneOffset
+                      LocalDateTime)))
 
+;;;
+;;; Protocols
+;;;
 
-(defmulti ^:private read! t/dispatch)
-(defmulti ^:private write! t/dispatch)
+(defprotocol Sink
+  (write-bytes! [snk bytes]))
 
+(defprotocol Source
+  (read-bytes! [src n]))
 
-(defn src
-  [type read-bytes!]
-  (memoize #(read! type read-bytes!)))
+(defprotocol Serialize
+  (ser! [dt snk val]))
 
+(defprotocol Deserialize
+  (de! [dt src]))
 
-(defn dest
-  [type write-bytes!]
-  (memoize #(write! type write-bytes! %)))
+;;
+;; Simple implementation
+;;
 
+(defrecord CollSource [bytes]
+  Source
+  (read-bytes! [src n]
+    (dosync
+     (let [[bytes buffer] (split-at n @(:bytes src))]
+       (ref-set (:bytes src) buffer)
+       bytes))))
 
-(defn- read-bytes!
-  [s n]
-  (s n))
+(defn collsrc [coll] (->CollSource (ref coll)))
 
+(defrecord MemorySink [bytes]
+  Sink
+  (write-bytes! [snk bytes]
+    (swap! (:bytes snk) #(reduce conj % bytes))
+    nil))
 
-(defn- write-bytes!
-  [d n val]
-  (d n val))
+(defn memsnk [] (->MemorySink (atom [])))
+(defn memsnk-bytes [snk] @(:bytes snk))
 
 
 ;;
-;; Endianness
+;; Helper functions
 ;;
 
-(defn- read-byte!->read-bytes!
-  [read-byte! count->offsets]
-  (fn [count]
-    (let [bytes (repeatedly read-byte!)
-          offsets (count->offsets count)]
-      (->> (map bit-shift-left bytes offsets)
+(defn- num->le-bytes [n num]
+  ;; Works incorrectly for n > 8
+  (let [byte-by-offset #(bit-and 0xFF (bit-shift-right num %))]
+    (->> (iterate #(+ % 8) 0)
+         (map byte-by-offset)
+         (take n))))
+
+(defn- le-bytes->num [bytes]
+  (->> (iterate #(+ % 8) 0)
+       (map bit-shift-left bytes)
+       (take (count bytes))
+       (reduce +)))
+
+(defn- read-num! [src n]
+  (->> (read-bytes! src n)
+       le-bytes->num))
+
+(defn- write-num! [snk n num]
+  (->> num
+       (num->le-bytes n)
+       (write-bytes! snk)))
+
+
+;;;
+;;; Specification
+;;;
+
+(extend-type ByteSpec
+  Serialize
+  (ser! [_ snk val] (->> val byte (write-num! snk 1)))
+  Deserialize
+  (de! [_ src] (->> (read-num! src 1) unchecked-byte)))
+
+(extend-type BoolSpec
+  Serialize
+  (ser! [_ snk val] (->> (if val 1 0) (ser! s/byte snk)))
+  Deserialize
+  (de! [_ src] (= 1 (de! s/byte src))))
+
+(extend-type IntSpec
+  Deserialize
+  (de! [_ src] (->> (read-num! src 4) unchecked-int))
+  Serialize
+  (ser! [_ snk val] (->> val int (write-num! snk 4))))
+
+(extend-type LongSpec
+  Deserialize
+  (de! [_ src] (->> (read-num! src 8) unchecked-long))
+  Serialize
+  (ser! [_ snk val] (->> val long (write-num! snk 8))))
+
+(extend-type FloatSpec
+  Deserialize
+  (de! [_ src] (->> (de! s/int src) Float/intBitsToFloat))
+  Serialize
+  (ser! [_ snk val] (->> val float Float/floatToIntBits (ser! s/int snk))))
+
+(extend-type DoubleSpec
+  Deserialize
+  (de! [_ src] (->> (de! s/long src) Double/longBitsToDouble))
+  Serialize
+  (ser! [_ snk val] (->> val double Double/doubleToLongBits (ser! s/long snk))))
+
+(extend-type TimeSpec
+  Serialize
+  (ser! [_ snk val] (->> (.toEpochSecond val ZoneOffset/UTC) (ser! s/long snk)))
+  Deserialize
+  (de! [_ src] (LocalDateTime/ofEpochSecond (de! s/long src) 0 ZoneOffset/UTC)))
+
+(extend-type ListSpec
+  Deserialize
+  (de! [lst src]
+    (let [count (de! s/int src)]
+      (->> (repeatedly #(de! (:spec lst) src))
            (take count)
-           (reduce +)))))
+           doall)))
+  Serialize
+  (ser! [lst snk val]
+    (ser! s/int snk (count val))
+    (->> val
+         (run! #(ser! (:spec lst) snk %)))))
 
+(extend-type StringSpec
+  Deserialize
+  (de! [_ src]
+    (->> (de! (s/list s/byte) src)
+         (map char)
+         (apply str)))
+  Serialize
+  (ser! [_ snk val]
+    (ser! (s/list s/byte) snk val)))
 
-(defn- write-byte!->write-bytes!
-  [write-byte! count->offsets]
-  (fn [count val]
-    (let [byte-by-offset #(bit-and 0xFF (bit-shift-right val %))]
-      (->> (count->offsets count)
-           (map byte-by-offset)
-           (take count)
-           (map write-byte!)
-           dorun))))
+(extend-type VectorSpec
+  Serialize
+  (ser! [vec snk val]
+    (->> val
+         (map #(ser! %1 snk %2) (:specs vec))
+         (run! identity)))
+  Deserialize
+  (de! [vec src]
+    (mapv #(de! % src) (:specs vec))))
 
+(defn position [f vec]
+  (->> vec
+       (map-indexed vector)
+       (filter (fn [[_ e]] (f e)))
+       first
+       first))
 
-(defn- count->le-offsets
-  [_]
-  (iterate #(+ % 8) 0))
+(extend-type ChoiceSpec
+  Serialize
+  (ser! [chs snk [tag val]]
+    (let [tag-idx (position (fn [[t _]] (= t tag)) (:keyspecs chs))
+          [_ tag-spec] (get (:keyspecs chs) tag-idx)]
+      (ser! s/byte snk tag-idx)
+      (ser! tag-spec snk val)))
+  Deserialize
+  (de! [chs src]
+    (let [tag-idx (de! s/byte src)
+          [tag tag-spec] (get (:keyspecs chs) (long tag-idx))]
+      [tag (de! tag-spec src)])))
 
-
-(defn- count->be-offsets
-  [n]
-  (iterate #(- % 8) (* 8 (- n 1))))
-
-
-(defn read-byte!->le-read-bytes!
-  [read-byte!]
-  (read-byte!->read-bytes! read-byte! count->le-offsets))
-
-
-(defn write-byte!->le-write-bytes!
-  [write-byte!]
-  (write-byte!->write-bytes! write-byte! count->le-offsets))
-
-
-(defn read-byte!->be-read-bytes!
-  [read-byte!]
-  (read-byte!->read-bytes! read-byte! count->be-offsets))
-
-
-(defn write-byte!->be-write-bytes!
-  [write-byte!]
-  (write-byte!->write-bytes! write-byte! count->be-offsets))
-
-
-;;
-;; Primitives
-;;
-
-(defmethod read! :byte [_ s]
-  (->> (read-bytes! s 1) byte))
-
-
-(defmethod write! :byte [_ s val]
-  (->> val byte (write-bytes! s 1)))
-
-
-(defmethod read! :int [_ s]
-  (->> (read-bytes! s 4) int))
-
-
-(defmethod write! :int [_ s val]
-  (->> val int (write-bytes! s 4)))
-
-
-(defmethod read! :long [_ s]
-  (->> (read-bytes! s 8) long))
-
-
-(defmethod write! :long [_ s val]
-  (->> val long (write-bytes! s 8)))
-
-
-(defmethod read! :double [_ s]
-  (->> (read! :long s) (Double/longBitsToDouble)))
-
-
-(defmethod write! :double [_ s val]
-  (->> val double Double/doubleToLongBits (write! :long s)))
-
-
-(defmethod read! :bool [_ s]
-  (= (read! :byte s) 1))
-
-
-(defmethod write! :bool [_ s val]
-  (write! :byte s (if val 1 0)))
-
-
-(defmethod read! :time [_ s]
-  (LocalDateTime/ofEpochSecond (read! :long s) 0 ZoneOffset/UTC))
-
-
-(defmethod write! :time [_ s val]
-  (write! :long s (.toEpochSecond val ZoneOffset/UTC)))
-
-
-(defmethod read! :str [_ s]
-  (->> (read! [:list :byte] s)
-       (map char)
-       (apply str)))
-
-
-(defmethod write! :str [_ s val]
-  (write! [:list :byte] s val))
-
-
-;;
-;; Combinators
-;;
-
-(defmethod read! :vec [[_ types] s]
-  (mapv #(read! % s) types))
-
-
-(defmethod write! :vec [[_ types] s val]
-  (doseq [[type val] (map vector types val)]
-    (write! type s val)))
-
-
-(defmethod read! :choice [[_ keytypes] s]
-  (let [idx (read! :int s)
-        [key type] (nth keytypes idx)]
-    [key (read! type s)]))
-
-
-(defmethod write! :choice [[_ keytypes] s c]
-  (let [[[idx [_ type]] & _]
-        (->> keytypes
-             (map-indexed vector)
-             (filter (fn [[_ [k _]]] (= k (first c)))))]
-    (write! :int s idx)
-    (write! type s (second c))))
-
-
-(defmethod read! :list [[_ type] s]
-  (let [n (read! :int s)]
-    (->> (read! [:seq type] s)
-         (take n)
-         doall)))
-
-
-(defmethod write! :list [[_ type] s vals]
-  (write! :int s (count vals))
-  (write! [:seq type] s vals))
-
-
-(defmethod read! :seq [[_ type] s]
-  (->> (repeatedly #(try (read! type s) (catch Exception _)))
-       (take-while identity)))
-
-
-(defmethod write! :seq [[_ type] s vals]
-  (doseq [val vals]
-    (write! type s val)))
-
-
-(defmethod read! :map [[_ keytypes] s]
-  (let [types (map second keytypes)
-        keys (map first keytypes)]
-    (->> (read! [:vec types] s)
-         (map vector keys)
+(extend-type MapSpec
+  Serialize
+  (ser! [spec snk m]
+    (->> (:keyspecs spec)
+         (run! (fn [[k s]] (ser! s snk (get m k))))))
+  Deserialize
+  (de! [spec src]
+    (->> (:keyspecs spec)
+         (map (fn [[k s]] [k (de! s src)]))
          (into {}))))
-
-
-(defmethod write! :map [[_ keytypes] s val]
-  (let [types (map second keytypes)
-        keys (map first keytypes)
-        vals (map #(get val %) keys)]
-    (write! [:vec types] s vals)))
